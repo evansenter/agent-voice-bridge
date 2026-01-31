@@ -61,9 +61,9 @@ async def incoming_call(request: Request):
     ws_url = f"{ws_url}/media-stream"
     logger.info(f"📡 WebSocket URL: {ws_url}")
     
+    # Skip the <Say> greeting - Gemini will speak first based on system prompt
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say>Connecting to Gemini.</Say>
     <Connect>
         <Stream url="{ws_url}">
             <Parameter name="caller" value="{caller}" />
@@ -115,7 +115,7 @@ async def media_stream(websocket: WebSocket):
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name="Aoede"
+                    voice_name="Puck"  # Playful, works with native-audio model
                 )
             )
         )
@@ -149,25 +149,41 @@ async def media_stream(websocket: WebSocket):
             nonlocal downsample_state
             chunks_sent = 0
             try:
-                async for response in session.receive():
-                    if response.server_content is None:
-                        continue
+                # Keep looping - the receive iterator may complete after each turn
+                while True:
+                    logger.debug("Starting Gemini receive loop")
+                    async for response in session.receive():
+                        if response.server_content is None:
+                            continue
+                        
+                        model_turn = response.server_content.model_turn
+                        if model_turn and model_turn.parts:
+                            for part in model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    audio_data = part.inline_data.data
+                                    b64_audio, downsample_state = process_outgoing_audio(
+                                        audio_data, downsample_state
+                                    )
+                                    await send_to_twilio(b64_audio)
+                                    chunks_sent += 1
+                                    if chunks_sent % 20 == 1:
+                                        logger.info(f"📤 Sent {chunks_sent} audio chunks to Twilio")
+                                # Log any text/transcript from Gemini
+                                if hasattr(part, 'text') and part.text:
+                                    logger.info(f"🤖 Gemini said: {part.text}")
+                        
+                        if response.server_content.turn_complete:
+                            logger.info("🔄 Gemini turn complete")
                     
-                    model_turn = response.server_content.model_turn
-                    if model_turn and model_turn.parts:
-                        for part in model_turn.parts:
-                            if part.inline_data and part.inline_data.data:
-                                audio_data = part.inline_data.data
-                                b64_audio, downsample_state = process_outgoing_audio(
-                                    audio_data, downsample_state
-                                )
-                                await send_to_twilio(b64_audio)
-                                chunks_sent += 1
-                                if chunks_sent % 20 == 1:
-                                    logger.info(f"📤 Sent {chunks_sent} audio chunks to Twilio")
+                    # Log input transcripts (what user said)
+                    if hasattr(response, 'input_transcript') and response.input_transcript:
+                        logger.info(f"🎤 User said: {response.input_transcript}")
                     
-                    if response.server_content.turn_complete:
-                        logger.info("🔄 Gemini turn complete")
+                    # Also check for transcript in other places
+                    if hasattr(response, 'transcript') and response.transcript:
+                        logger.info(f"📝 Transcript: {response.transcript}")
+                    
+                    logger.debug("Gemini receive iterator exhausted, re-entering...")
                         
             except asyncio.CancelledError:
                 logger.info("Gemini receiver cancelled")
@@ -176,6 +192,17 @@ async def media_stream(websocket: WebSocket):
         
         # Start receiver task
         receive_task = asyncio.create_task(gemini_receiver())
+        
+        # Send initial prompt to start conversation
+        async def send_initial_prompt():
+            await asyncio.sleep(0.5)  # Let connection stabilize
+            await session.send(
+                input="Hello! Start by greeting the caller warmly.",
+                end_of_turn=True
+            )
+            logger.info("📢 Sent initial prompt to Gemini")
+        
+        asyncio.create_task(send_initial_prompt())
         
         # Audio buffer (send every ~300ms = 9600 bytes at 16kHz)
         audio_buffer = bytearray()
@@ -206,9 +233,22 @@ async def media_stream(websocket: WebSocket):
                         
                         # Send buffered audio to Gemini
                         if len(audio_buffer) >= BUFFER_SIZE:
+                            audio_bytes = bytes(audio_buffer)
+                            
+                            # Log audio level to debug if we're sending silence
+                            import struct
+                            samples = struct.unpack(f'{len(audio_bytes)//2}h', audio_bytes)
+                            max_amp = max(abs(s) for s in samples)
+                            
+                            if not hasattr(session, '_audio_sends'):
+                                session._audio_sends = 0
+                            session._audio_sends += 1
+                            if session._audio_sends % 10 == 1:
+                                logger.info(f"🎤 Sending to Gemini: {len(audio_bytes)} bytes, max_amp={max_amp}")
+                            
                             await session.send(
                                 input={
-                                    "data": bytes(audio_buffer),
+                                    "data": audio_bytes,
                                     "mime_type": "audio/pcm;rate=16000"
                                 },
                                 end_of_turn=False
