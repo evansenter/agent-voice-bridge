@@ -16,7 +16,7 @@ class GeminiLiveClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.0-flash-exp",
+        model: str = "gemini-2.5-flash-native-audio-latest",
         system_prompt: str = "",
     ):
         """Initialize the Gemini Live client.
@@ -31,8 +31,8 @@ class GeminiLiveClient:
         self.system_prompt = system_prompt
         
         self._client: genai.Client | None = None
-        self._session: types.AsyncSession | None = None
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._session = None
+        self._context_manager = None
         self._connected = False
 
     async def connect(self):
@@ -60,38 +60,54 @@ class GeminiLiveClient:
             ) if self.system_prompt else None,
         )
         
-        # Connect
-        self._session = await self._client.aio.live.connect(
+        # Connect - store the context manager and enter it
+        self._context_manager = self._client.aio.live.connect(
             model=self.model,
             config=config,
-        ).__aenter__()
+        )
+        self._session = await self._context_manager.__aenter__()
         
         self._connected = True
         logger.info("Connected to Gemini Live")
 
+    _audio_chunks_sent: int = 0
+    _last_audio_log: float = 0
+    
     async def send_audio(self, audio_bytes: bytes):
         """Send audio to Gemini.
         
         Args:
             audio_bytes: PCM16 audio at 16kHz
         """
+        import struct
+        import time
+        
         if not self._session:
             logger.warning("Cannot send audio - not connected")
             return
-            
-        # Create audio blob
-        audio_blob = types.Blob(
-            mime_type="audio/pcm;rate=16000",
-            data=audio_bytes,
-        )
         
-        # Send to Gemini
-        await self._session.send(
-            input=types.LiveClientRealtimeInput(
-                media_chunks=[audio_blob],
-            ),
-            end_of_turn=False,
-        )
+        # Calculate audio level for debugging
+        if len(audio_bytes) >= 2:
+            samples = struct.unpack(f'{len(audio_bytes)//2}h', audio_bytes)
+            max_level = max(abs(s) for s in samples)
+            avg_level = sum(abs(s) for s in samples) // len(samples)
+            
+            self._audio_chunks_sent += 1
+            now = time.time()
+            if now - self._last_audio_log > 2.0:  # Log every 2 seconds
+                logger.info(f"🎤 Audio stats: chunks={self._audio_chunks_sent}, max={max_level}, avg={avg_level}")
+                self._last_audio_log = now
+            
+        try:
+            # Send realtime audio input
+            await self._session.send_realtime_input(
+                audio=types.Blob(
+                    mime_type="audio/pcm;rate=16000",
+                    data=audio_bytes,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error sending audio: {e}")
 
     async def receive_audio(self) -> AsyncIterator[bytes]:
         """Receive audio responses from Gemini.
@@ -100,35 +116,53 @@ class GeminiLiveClient:
             PCM16 audio chunks at 24kHz
         """
         if not self._session:
+            logger.warning("receive_audio called but no session")
             return
-            
-        async for response in self._session.receive():
-            # Check for audio data
-            if response.data:
-                yield response.data
+        
+        logger.info("Starting to receive audio from Gemini...")
+        
+        try:
+            async for response in self._session.receive():
+                resp_type = type(response).__name__
+                logger.info(f"📩 Gemini response: {resp_type}")
                 
-            # Check for server content (model responses)
-            if response.server_content:
-                for part in response.server_content.model_turn.parts:
-                    if part.inline_data and part.inline_data.data:
-                        yield part.inline_data.data
-
-    async def interrupt(self):
-        """Interrupt the current response (barge-in)."""
-        if not self._session:
-            return
-            
-        # Send interrupt signal
-        # Note: Gemini automatically handles interruption when new audio is sent
-        logger.info("Interrupting Gemini response")
+                # Check for audio data in different response formats
+                if hasattr(response, 'data') and response.data:
+                    logger.info(f"🔊 Got direct data: {len(response.data)} bytes")
+                    yield response.data
+                    
+                # Check for server content (model responses)
+                if hasattr(response, 'server_content') and response.server_content:
+                    sc = response.server_content
+                    logger.debug(f"Server content: turn_complete={getattr(sc, 'turn_complete', None)}")
+                    
+                    if hasattr(sc, 'model_turn') and sc.model_turn:
+                        for part in sc.model_turn.parts:
+                            if hasattr(part, 'inline_data') and part.inline_data:
+                                if part.inline_data.data:
+                                    logger.info(f"🔊 Got inline audio: {len(part.inline_data.data)} bytes")
+                                    yield part.inline_data.data
+                            elif hasattr(part, 'text') and part.text:
+                                logger.info(f"📝 Got text: {part.text[:100]}...")
+                                
+                # Check for tool calls or other content
+                if hasattr(response, 'tool_call'):
+                    logger.info(f"🔧 Got tool call: {response.tool_call}")
+                    
+        except asyncio.CancelledError:
+            logger.info("receive_audio cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error receiving audio: {e}", exc_info=True)
 
     async def close(self):
         """Close the connection."""
-        if self._session:
+        if self._context_manager:
             try:
-                await self._session.__aexit__(None, None, None)
+                await self._context_manager.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning(f"Error closing session: {e}")
+            self._context_manager = None
             self._session = None
             
         self._connected = False
